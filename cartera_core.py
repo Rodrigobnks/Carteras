@@ -122,7 +122,7 @@ def _best_header_row(preview: pd.DataFrame) -> tuple[int, int]:
 
 def parse_filename_metadata(filename: str) -> tuple[str, date | None]:
     upper_name = filename.upper()
-    portfolio_type = "México" if "PRESICO" in upper_name else "LATAM" if "LATAM" in upper_name else "No identificado"
+    portfolio_type = "LATAM" if "LATAM" in upper_name else "México"
     match = re.search(r"(20\d{2})[-_ ](0[1-9]|1[0-2])[-_ ]([0-2]\d|3[01])", filename)
     parsed_date = None
     if match:

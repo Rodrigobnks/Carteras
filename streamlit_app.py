@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -19,7 +20,9 @@ from cartera_core import (
     multi_disbursement_report,
     prepare_portfolio,
     read_portfolio_bytes,
+    resolve_column,
     resolve_key_text,
+    normalize_text,
 )
 
 
@@ -38,6 +41,47 @@ def short_name(filename: str) -> str:
 def concat_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
     nonempty = [frame for frame in frames if frame is not None]
     return pd.concat(nonempty, ignore_index=True, sort=False) if nonempty else pd.DataFrame()
+
+
+def country_label(value: object) -> str:
+    text = str(value).strip()
+    normalized = normalize_text(text)
+    if normalized == "mexico":
+        return "México"
+    return text
+
+
+def available_countries(items: list[LoadedPortfolio]) -> list[str]:
+    countries: dict[str, str] = {}
+    for portfolio in items:
+        country_column, _ = resolve_column("pais", portfolio.dataframe.columns, minimum_score=70)
+        if country_column is None:
+            continue
+        for value in portfolio.dataframe[country_column].dropna().unique():
+            label = country_label(value)
+            normalized = normalize_text(label)
+            if normalized:
+                countries.setdefault(normalized, label)
+    return [countries[key] for key in sorted(countries, key=lambda item: countries[item].casefold())]
+
+
+def filter_portfolios_by_country(
+    items: list[LoadedPortfolio],
+    selected_country: str,
+) -> list[LoadedPortfolio]:
+    if selected_country == "Todos":
+        return items
+    target = normalize_text(selected_country)
+    filtered: list[LoadedPortfolio] = []
+    for portfolio in items:
+        country_column, _ = resolve_column("pais", portfolio.dataframe.columns, minimum_score=70)
+        if country_column is None:
+            frame = portfolio.dataframe.iloc[0:0].copy()
+        else:
+            country_values = portfolio.dataframe[country_column].map(country_label).map(normalize_text)
+            frame = portfolio.dataframe.loc[country_values.eq(target)].copy().reset_index(drop=True)
+        filtered.append(replace(portfolio, dataframe=frame))
+    return filtered
 
 
 def show_downloads(frame: pd.DataFrame, label: str, filename_stem: str, key_prefix: str) -> None:
@@ -111,6 +155,18 @@ if sort_by_date:
     portfolios.sort(key=lambda item: (item.cutoff_date is None, item.cutoff_date or datetime.max.date(), item.upload_order))
 
 st.subheader("Archivos reconocidos")
+country_choices = ["Todos", *available_countries(portfolios)]
+with st.sidebar:
+    st.divider()
+    st.header("3. Filtrar datos")
+    selected_country = st.selectbox(
+        "País",
+        options=country_choices,
+        index=0,
+        help="El filtro se aplica a todos los análisis y a los archivos descargados.",
+    )
+
+filtered_portfolios = filter_portfolios_by_country(portfolios, selected_country)
 file_summary = pd.DataFrame([
     {
         "Orden": index + 1,
@@ -119,14 +175,20 @@ file_summary = pd.DataFrame([
         "Fecha detectada": portfolio.cutoff_date.isoformat() if portfolio.cutoff_date else "No detectada",
         "Hoja": portfolio.sheet_name,
         "Fila de encabezados": portfolio.header_row,
-        "Registros": len(portfolio.dataframe),
+        "Registros originales": len(portfolio.dataframe),
+        "Registros analizados": len(filtered_portfolios[index].dataframe),
         "Columnas": len(portfolio.dataframe.columns),
     }
     for index, portfolio in enumerate(portfolios)
 ])
 st.dataframe(file_summary, hide_index=True, use_container_width=True)
+if selected_country != "Todos":
+    st.info(f"Filtro activo: **{selected_country}**. Todos los resultados y las descargas usan únicamente ese país.")
+if all(portfolio.dataframe.empty for portfolio in filtered_portfolios):
+    st.warning(f"No hay registros para {selected_country} en los archivos cargados.")
+    st.stop()
 
-reference = portfolios[0]
+reference = filtered_portfolios[0]
 suggested_columns, resolution_details = resolve_key_text(key_text, reference.dataframe.columns)
 if not suggested_columns:
     st.error("No pude asociar el texto de la llave con las columnas del primer archivo. Revisa la descripción.")
@@ -134,14 +196,17 @@ if not suggested_columns:
     st.stop()
 
 selection_key = hashlib.sha1((key_text + "|" + "|".join(suggested_columns)).encode("utf-8")).hexdigest()[:12]
-selected_key_columns = st.multiselect(
-    "Columnas interpretadas para la llave (puedes corregirlas)",
-    options=list(reference.dataframe.columns),
-    default=suggested_columns,
-    key=f"key_columns_{selection_key}",
-)
-with st.expander("Ver cómo se interpretó el texto"):
-    st.dataframe(pd.DataFrame(resolution_details), hide_index=True, use_container_width=True)
+with st.sidebar:
+    st.divider()
+    st.header("4. Confirmar llave")
+    selected_key_columns = st.multiselect(
+        "Columnas interpretadas (puedes corregirlas)",
+        options=list(reference.dataframe.columns),
+        default=suggested_columns,
+        key=f"key_columns_{selection_key}",
+    )
+    with st.expander("Ver interpretación"):
+        st.dataframe(pd.DataFrame(resolution_details), hide_index=True, use_container_width=True)
 
 if not selected_key_columns:
     st.warning("Selecciona al menos una columna para formar la llave.")
@@ -149,7 +214,7 @@ if not selected_key_columns:
 
 prepared: list[dict[str, object]] = []
 prep_errors: list[str] = []
-for portfolio in portfolios:
+for portfolio in filtered_portfolios:
     try:
         frame, actual_key_columns, atraso_column = prepare_portfolio(portfolio, selected_key_columns)
         prepared.append({
@@ -260,6 +325,7 @@ metadata = [
     ("Fecha de generación", datetime.now().strftime("%Y-%m-%d %H:%M")),
     ("Llave solicitada", key_text),
     ("Llave interpretada", " & ".join(selected_key_columns)),
+    ("Filtro de país", selected_country),
     ("Regla de atraso", "dias_de_atraso > 0"),
     ("Regla de corriente", "dias_de_atraso = 0"),
     ("Comparaciones", "Cortes consecutivos según el orden mostrado"),
@@ -337,9 +403,11 @@ with tabs[5]:
     st.dataframe(invalid_all, hide_index=True, use_container_width=True)
     show_downloads(invalid_all, "llaves incompletas", "llaves_incompletas", "invalid")
 
-with st.expander("Vista previa de datos originales"):
-    selected_preview = st.selectbox("Archivo", [portfolio.name for portfolio in portfolios])
-    preview_portfolio = next(portfolio for portfolio in portfolios if portfolio.name == selected_preview)
+with st.expander("Vista previa de datos"):
+    selected_preview = st.selectbox("Archivo", [portfolio.name for portfolio in filtered_portfolios])
+    preview_portfolio = next(portfolio for portfolio in filtered_portfolios if portfolio.name == selected_preview)
+    if selected_country != "Todos":
+        st.caption(f"Vista previa filtrada por {selected_country}.")
     st.dataframe(preview_portfolio.dataframe.head(100), hide_index=True, use_container_width=True)
 
 st.caption("Los archivos se procesan en memoria durante la sesión. No incluyas carteras reales dentro del repositorio de GitHub.")

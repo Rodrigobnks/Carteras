@@ -28,9 +28,18 @@ from cartera_core import (
 
 st.set_page_config(page_title="Comparador de carteras", page_icon="📊", layout="wide")
 
+APP_VERSION = "2026.08.13.3"
+REQUIRED_DOWNLOAD_COLUMNS = [
+    "id_desembolso",
+    "tipo_desembolso",
+    "ruta",
+    "dbc_cliente_id",
+    "Nombre_Cliente",
+]
+
 
 @st.cache_data(show_spinner=False)
-def load_file(file_bytes: bytes, filename: str, upload_order: int) -> LoadedPortfolio:
+def load_file(file_bytes: bytes, filename: str, upload_order: int, app_version: str) -> LoadedPortfolio:
     return read_portfolio_bytes(file_bytes, filename, upload_order)
 
 
@@ -41,6 +50,14 @@ def short_name(filename: str) -> str:
 def concat_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
     nonempty = [frame for frame in frames if frame is not None]
     return pd.concat(nonempty, ignore_index=True, sort=False) if nonempty else pd.DataFrame()
+
+
+def ensure_download_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    result = frame.copy()
+    for column in REQUIRED_DOWNLOAD_COLUMNS:
+        if column not in result.columns:
+            result[column] = pd.NA
+    return result
 
 
 def country_label(value: object) -> str:
@@ -108,6 +125,7 @@ def show_downloads(frame: pd.DataFrame, label: str, filename_stem: str, key_pref
 
 st.title("📊 Comparador de carteras")
 st.caption("Carga hasta tres cortes, compara clientes mediante una llave flexible y descarga los resultados en Excel.")
+st.caption(f"Versión {APP_VERSION}")
 
 with st.sidebar:
     st.header("1. Cargar archivos")
@@ -143,7 +161,7 @@ load_errors: list[str] = []
 with st.spinner("Leyendo y validando archivos..."):
     for order, uploaded in enumerate(uploaded_files):
         try:
-            portfolios.append(load_file(uploaded.getvalue(), uploaded.name, order))
+            portfolios.append(load_file(uploaded.getvalue(), uploaded.name, order, APP_VERSION))
         except Exception as exc:
             load_errors.append(f"{uploaded.name}: {exc}")
 
@@ -303,6 +321,15 @@ duplicates_all = concat_frames(duplicate_tables)
 invalid_all = concat_frames(invalid_tables)
 multi_summary = pd.DataFrame(multi_summary_rows)
 multi_all = concat_frames(multi_tables)
+
+# Validación final común a las tablas que se muestran y se descargan. Esto
+# garantiza el mismo esquema en Excel y CSV aunque un reporte no tenga filas.
+exits_all = ensure_download_columns(exits_all)
+entries_all = ensure_download_columns(entries_all)
+status_detail_all = ensure_download_columns(status_detail_all)
+duplicates_all = ensure_download_columns(duplicates_all)
+invalid_all = ensure_download_columns(invalid_all)
+multi_all = ensure_download_columns(multi_all)
 
 report_sheets: dict[str, pd.DataFrame] = {
     "Archivos": file_summary,

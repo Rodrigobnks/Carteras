@@ -123,14 +123,49 @@ def _best_header_row(preview: pd.DataFrame) -> tuple[int, int]:
 def parse_filename_metadata(filename: str) -> tuple[str, date | None]:
     upper_name = filename.upper()
     portfolio_type = "LATAM" if "LATAM" in upper_name else "México"
-    match = re.search(r"(20\d{2})[-_ ](0[1-9]|1[0-2])[-_ ]([0-2]\d|3[01])", filename)
-    parsed_date = None
-    if match:
+    parsed_date: date | None = None
+
+    date_patterns = (
+        (r"(?<!\d)(20\d{2})[-_ ](0[1-9]|1[0-2])[-_ ]([0-2]\d|3[01])(?!\d)", "%Y-%m-%d", "ymd"),
+        (r"(?<!\d)([0-2]\d|3[01])[-_ ](0[1-9]|1[0-2])[-_ ](20\d{2})(?!\d)", "%d-%m-%Y", "dmy"),
+        (r"(?<!\d)([0-2]\d|3[01])(0[1-9]|1[0-2])(20\d{2})(?!\d)", "%d%m%Y", "compact"),
+        (r"(?<!\d)(20\d{2})(0[1-9]|1[0-2])([0-2]\d|3[01])(?!\d)", "%Y%m%d", "compact"),
+    )
+    for pattern, date_format, style in date_patterns:
+        match = re.search(pattern, filename)
+        if not match:
+            continue
+        separator = "-" if style in {"ymd", "dmy"} else ""
         try:
-            parsed_date = datetime.strptime("-".join(match.groups()), "%Y-%m-%d").date()
+            parsed_date = datetime.strptime(separator.join(match.groups()), date_format).date()
+            break
         except ValueError:
-            parsed_date = None
+            continue
     return portfolio_type, parsed_date
+
+
+def detect_cutoff_date(frame: pd.DataFrame) -> date | None:
+    corte_column, _ = resolve_column("corte", frame.columns, minimum_score=75)
+    if corte_column is None:
+        return None
+
+    values = frame[corte_column].dropna()
+    if values.empty:
+        return None
+
+    sample = values.iloc[0]
+    try:
+        if isinstance(sample, (pd.Timestamp, datetime, date)):
+            return pd.Timestamp(sample).date()
+
+        numeric = pd.to_numeric(pd.Series([sample]), errors="coerce").iloc[0]
+        if pd.notna(numeric) and 1 <= float(numeric) <= 100000:
+            return pd.to_datetime(float(numeric), unit="D", origin="1899-12-30").date()
+
+        parsed = pd.to_datetime(sample, errors="coerce", dayfirst=True)
+        return parsed.date() if pd.notna(parsed) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _read_csv_bytes(file_bytes: bytes) -> tuple[pd.DataFrame, str, int]:
@@ -189,6 +224,9 @@ def read_portfolio_bytes(file_bytes: bytes, filename: str, upload_order: int = 0
     frame = frame.loc[:, keep_columns]
     frame.columns = make_unique_columns(frame.columns)
     portfolio_type, cutoff_date = parse_filename_metadata(filename)
+
+    if cutoff_date is None:
+        cutoff_date = detect_cutoff_date(frame)
 
     country_column = resolve_column("pais", frame.columns, minimum_score=72)[0]
     if country_column is None:

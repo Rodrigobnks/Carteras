@@ -377,28 +377,66 @@ def prepare_portfolio(
     return frame, key_columns, atraso_column
 
 
+REQUIRED_REPORT_FIELDS: tuple[tuple[str, str], ...] = (
+    ("id_desembolso", "id_desembolso"),
+    ("tipo_desembolso", "tipo_desembolso"),
+    ("ruta", "ruta"),
+    ("dbc_cliente_id", "dbc_cliente_id"),
+    ("Nombre_Cliente", "Nombre_Cliente"),
+)
+
+
+def _required_report_sample(
+    frame: pd.DataFrame,
+    group_column: str,
+    exclude: Iterable[str] = (),
+) -> pd.DataFrame:
+    excluded = set(exclude)
+    sample = frame.drop_duplicates(group_column)[[group_column]].copy()
+    for output_name, query in REQUIRED_REPORT_FIELDS:
+        if output_name in excluded:
+            continue
+        source_column, _ = resolve_column(query, frame.columns, minimum_score=70)
+        sample[output_name] = (
+            frame.loc[sample.index, source_column].to_numpy()
+            if source_column is not None
+            else pd.NA
+        )
+    return sample
+
+
 def duplicate_report(frame: pd.DataFrame, key_columns: Sequence[str]) -> pd.DataFrame:
     counts = frame.groupby("_llave", dropna=False).size().rename("veces_repetida").reset_index()
     duplicated = counts[counts["veces_repetida"] > 1]
+    extra_columns = [name for name, _ in REQUIRED_REPORT_FIELDS if name not in key_columns]
     if duplicated.empty:
-        return pd.DataFrame(columns=[*key_columns, "llave", "llave_valida", "veces_repetida"])
+        return pd.DataFrame(columns=[*key_columns, *extra_columns, "llave", "llave_valida", "veces_repetida"])
     sample = frame.drop_duplicates("_llave")[["_llave", "_llave_valida", *key_columns]]
+    required = _required_report_sample(frame, "_llave", exclude=key_columns)
+    sample = sample.merge(required, on="_llave", how="left")
     result = duplicated.merge(sample, on="_llave", how="left")
-    return result[[*key_columns, "_llave", "_llave_valida", "veces_repetida"]].rename(
+    return result[[*key_columns, *extra_columns, "_llave", "_llave_valida", "veces_repetida"]].rename(
         columns={"_llave": "llave", "_llave_valida": "llave_valida"}
     ).sort_values("veces_repetida", ascending=False)
 
 
 def invalid_key_report(frame: pd.DataFrame, key_columns: Sequence[str]) -> pd.DataFrame:
     columns = ["_fila_origen", *key_columns, "_llave"]
-    result = frame.loc[~frame["_llave_valida"], columns].copy()
+    mask = ~frame["_llave_valida"]
+    result = frame.loc[mask, columns].copy()
+    for output_name, query in REQUIRED_REPORT_FIELDS:
+        if output_name in result.columns:
+            continue
+        source_column, _ = resolve_column(query, frame.columns, minimum_score=70)
+        result[output_name] = frame.loc[mask, source_column].to_numpy() if source_column is not None else pd.NA
     return result.rename(columns={"_fila_origen": "fila_origen", "_llave": "llave"})
 
 
 def _key_summary(frame: pd.DataFrame, key_columns: Sequence[str]) -> pd.DataFrame:
     valid = frame[frame["_llave_valida"]].copy()
+    extra_columns = [name for name, _ in REQUIRED_REPORT_FIELDS if name not in key_columns]
     if valid.empty:
-        return pd.DataFrame(columns=["llave", *key_columns, "dias_atraso", "estado", "filas"])
+        return pd.DataFrame(columns=["llave", *key_columns, *extra_columns, "dias_atraso", "estado", "filas"])
     summary = (
         valid.groupby("_llave", as_index=False)
         .agg(dias_atraso=("_dias_atraso", "max"), filas=("_llave", "size"))
@@ -406,7 +444,9 @@ def _key_summary(frame: pd.DataFrame, key_columns: Sequence[str]) -> pd.DataFram
     )
     summary["estado"] = summary["dias_atraso"].gt(0).map({True: "Atraso", False: "Al corriente"})
     sample = valid.drop_duplicates("_llave")[["_llave", *key_columns]].rename(columns={"_llave": "llave"})
-    return summary.merge(sample, on="llave", how="left")[["llave", *key_columns, "dias_atraso", "estado", "filas"]]
+    required = _required_report_sample(valid, "_llave", exclude=key_columns).rename(columns={"_llave": "llave"})
+    sample = sample.merge(required, on="llave", how="left")
+    return summary.merge(sample, on="llave", how="left")[["llave", *key_columns, *extra_columns, "dias_atraso", "estado", "filas"]]
 
 
 def compare_presence(
@@ -455,11 +495,17 @@ def compare_status(
     right = _key_summary(second, second_key_columns)
     merged = left.merge(right, on="llave", how="inner", suffixes=("_antes", "_despues"))
     if merged.empty:
-        detail = pd.DataFrame(columns=["comparacion", "llave", "estado_antes", "estado_despues"])
+        detail = pd.DataFrame(columns=[
+            "comparacion", "llave", "dias_atraso_antes", "estado_antes",
+            "dias_atraso_despues", "estado_despues",
+            *[name for name, _ in REQUIRED_REPORT_FIELDS],
+        ])
     else:
         detail = merged[
             merged["estado_antes"].ne(merged["estado_despues"])
         ][["llave", "dias_atraso_antes", "estado_antes", "dias_atraso_despues", "estado_despues"]].copy()
+        required = _required_report_sample(second, "_llave").rename(columns={"_llave": "llave"})
+        detail = detail.merge(required, on="llave", how="left")
         detail.insert(0, "comparacion", f"{first_name} → {second_name}")
 
     corriente_atraso = int(
@@ -511,20 +557,50 @@ def multi_disbursement_report(
         values = sorted({_normalize_key_value(value) for value in series if _normalize_key_value(value) != EMPTY_KEY_PART})
         return " | ".join(values)
 
-    grouped = (
-        working.groupby("_cliente_llave", as_index=False)
-        .agg(
-            cantidad_desembolsos=(disbursement_column, lambda values: values.map(_normalize_key_value).replace(EMPTY_KEY_PART, pd.NA).nunique()),
-            ids_desembolso=(disbursement_column, join_unique),
-            tipos_desembolso=(type_column, join_unique),
-            cantidad_tipos=(type_column, lambda values: values.map(_normalize_key_value).replace(EMPTY_KEY_PART, pd.NA).nunique()),
-            filas=("_cliente_llave", "size"),
-        )
-    )
+    def join_display_unique(series: pd.Series) -> str:
+        values: list[str] = []
+        seen: set[str] = set()
+        for value in series:
+            if pd.isna(value) or str(value).strip() == "":
+                continue
+            display = str(int(value)) if isinstance(value, float) and value.is_integer() else str(value).strip()
+            marker = normalize_text(display)
+            if marker not in seen:
+                seen.add(marker)
+                values.append(display)
+        return " | ".join(values)
+
+    aggregations: dict[str, tuple[str, object]] = {
+        "cantidad_desembolsos": (disbursement_column, lambda values: values.map(_normalize_key_value).replace(EMPTY_KEY_PART, pd.NA).nunique()),
+        "ids_desembolso": (disbursement_column, join_unique),
+        "tipos_desembolso": (type_column, join_unique),
+        "cantidad_tipos": (type_column, lambda values: values.map(_normalize_key_value).replace(EMPTY_KEY_PART, pd.NA).nunique()),
+        "filas": ("_cliente_llave", "size"),
+    }
+    for output_name, query in REQUIRED_REPORT_FIELDS:
+        source_column, _ = resolve_column(query, working.columns, minimum_score=70)
+        if source_column is not None:
+            aggregations[output_name] = (source_column, join_display_unique)
+
+    grouped = working.groupby("_cliente_llave", as_index=False).agg(**aggregations)
+    for output_name, _ in REQUIRED_REPORT_FIELDS:
+        if output_name not in grouped.columns:
+            grouped[output_name] = pd.NA
     grouped = grouped[grouped["cantidad_desembolsos"] > 1].copy()
-    sample = working.drop_duplicates("_cliente_llave")[["_cliente_llave", *client_columns]]
+    sample_client_columns = [column for column in client_columns if column not in grouped.columns]
+    sample = working.drop_duplicates("_cliente_llave")[["_cliente_llave", *sample_client_columns]]
     result = grouped.merge(sample, on="_cliente_llave", how="left").rename(columns={"_cliente_llave": "llave_cliente"})
-    result = result[[*client_columns, "llave_cliente", "cantidad_desembolsos", "cantidad_tipos", "tipos_desembolso", "ids_desembolso", "filas"]]
+    ordered_columns = list(dict.fromkeys([
+        *client_columns,
+        "llave_cliente",
+        *[name for name, _ in REQUIRED_REPORT_FIELDS],
+        "cantidad_desembolsos",
+        "cantidad_tipos",
+        "tipos_desembolso",
+        "ids_desembolso",
+        "filas",
+    ]))
+    result = result[ordered_columns]
     return result.sort_values("cantidad_desembolsos", ascending=False), client_columns, disbursement_column, type_column
 
 
